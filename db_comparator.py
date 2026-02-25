@@ -2,7 +2,9 @@
 SQLite Database Comparison Tool
 ================================
 A comprehensive tool to compare two SQLite database files and visualize differences.
-
+Feature added - 
+    1. Key Details added in summary section to quickly identify which tables are identical and which have differences, along with a count of mismatches for each table.
+    2. Added a detailed differences table that lists all tables with differences, the type of difference (schema, row count, data), and specific details about the differences for quick reference.
 """
 
 import sqlite3
@@ -19,7 +21,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
+from rich.prompt import Confirm, Prompt
 
+def gen(text: str, style: str):
+    """This program is used to generate strings to print in sytl
+    Eg - print_(gen("Error occured :( , failure not found!", 'bold #ff471a'))"""
+    output = "[{}]{}[/{}]".format(style, text, style)
+    return output
 
 @dataclass
 class TableComparison:
@@ -630,6 +638,58 @@ class SQLiteComparator:
         self.console.print(summary_tree)
         self.console.print()
 
+        # Key Differences Panel
+        key_diff_text = Text()
+        if comparison.is_identical:
+            key_diff_text.append("No key differences found. Databases are identical.", style="bold green")
+        else:
+            # Tables only in DB1
+            if comparison.tables_only_in_db1:
+                key_diff_text.append("[❌] ", style="bold red")
+                key_diff_text.append("Tables existing only in DB1: ", style="bold red")
+                key_diff_text.append(", ".join(sorted(comparison.tables_only_in_db1)), style="red")
+                key_diff_text.append("\n")
+
+            # Tables only in DB2
+            if comparison.tables_only_in_db2:
+                key_diff_text.append("[❌] ", style="bold red")
+                key_diff_text.append("Tables existing only in DB2: ", style="bold red")
+                key_diff_text.append(", ".join(sorted(comparison.tables_only_in_db2)), style="red")
+                key_diff_text.append("\n")
+
+            # Common tables
+            for table_name in sorted(comparison.common_tables):
+                table_comp = comparison.table_comparisons[table_name]
+                if table_comp.is_identical:
+                    key_diff_text.append("[✅] ", style="bold green")
+                    key_diff_text.append(f"{table_name} table is identical\n", style="bold green")
+                else:
+                    key_diff_text.append("[❌] ", style="bold red")
+                    mismatch_count = 0
+                    mismatch_details = []
+                    if not table_comp.schema_match:
+                        schema_diff_count = len(table_comp.schema_diff)
+                        mismatch_count += schema_diff_count
+                        mismatch_details.append(f"{schema_diff_count} schema mismatches")
+                    if table_comp.row_count_db1 != table_comp.row_count_db2:
+                        mismatch_details.append("row count mismatch")
+                        mismatch_count += 1
+                    if table_comp.data_differences:
+                        diff_data = table_comp.data_differences
+                        if not diff_data.get("is_data_identical", True):
+                            only_db1 = diff_data.get("rows_only_in_db1", 0)
+                            only_db2 = diff_data.get("rows_only_in_db2", 0)
+                            data_mismatch_count = only_db1 + only_db2
+                            mismatch_count += data_mismatch_count
+                            mismatch_details.append(f"{data_mismatch_count} data row mismatches")
+                    key_diff_text.append(f"{table_name} table has {mismatch_count} mismatches", style="bold red")
+                    if mismatch_details:
+                        key_diff_text.append(f" ({', '.join(mismatch_details)})", style="red")
+                    key_diff_text.append("\n")
+
+        key_diff_panel = Panel(key_diff_text, title="Key Differences", style="bold magenta", box=box.ROUNDED)
+        self.console.print(key_diff_panel)
+
         # Add a detailed differences table
         if not comparison.is_identical:
             self.console.print()
@@ -699,7 +759,57 @@ class SQLiteComparator:
             self.console.print()
             self.display_detailed_differences(comparison)
 
-    # --------- Additional helper methods for future enhancements (e.g., export results, generate reports, etc.) can be added here ---------
+    def detailed_table_comparison(self, table_name: str, compare_columns: List[str]):
+        """
+        Perform detailed comparison of a specific table using primary key for matching and showing differences for selected columns.
+        """
+        with self.get_connection(self.db1_path) as conn1, self.get_connection(self.db2_path) as conn2:
+            schema1 = self.get_table_schema(conn1, table_name)
+            pk_cols = [col[1] for col in schema1 if col[5] != 0]  # PK flag is at index 5
+            if not pk_cols:
+                pk_cols = [schema1[0][1]] if schema1 else []  # Fall back to first column
+
+            self.console.print(gen(f"Using primary key(s): {', '.join(pk_cols)} for matching", "bold yellow"))
+
+            data1 = self.get_table_data(conn1, table_name)
+            data2 = self.get_table_data(conn2, table_name)
+
+        def make_key(row):
+            return tuple(row.get(col) for col in pk_cols)
+
+        data1_map = {make_key(row): row for row in data1 if make_key(row)}
+        data2_map = {make_key(row): row for row in data2 if make_key(row)}
+
+        common_keys = set(data1_map) & set(data2_map)
+        mismatched_rows = [k for k in common_keys if any(data1_map[k].get(col) != data2_map[k].get(col) for col in compare_columns)]
+
+        if not mismatched_rows:
+            self.console.print(gen("No mismatched data in selected columns.", "bold green"))
+            return
+
+        self.console.print(gen(f"Found {len(mismatched_rows)} mismatched rows in selected columns.", "bold red"))
+
+        for key in mismatched_rows:
+            row1 = data1_map[key]
+            row2 = data2_map[key]
+
+            diff_table = Table(title=gen(f"Mismatched Row (Key: {key})", "bold red"), box=box.DOUBLE, border_style="red", show_header=True)
+            diff_table.add_column("Key", style="bold yellow")
+            for col in compare_columns:
+                diff_table.add_column(f"{col} - DB1", style="cyan")
+                diff_table.add_column(f"{col} - DB2", style="magenta")
+
+            row_data = [str(key)]
+            for col in compare_columns:
+                v1 = row1.get(col, "NULL")
+                v2 = row2.get(col, "NULL")
+                style1 = "red" if v1 != v2 else "green"
+                style2 = "red" if v1 != v2 else "green"
+                row_data.append(gen(str(v1), style1))
+                row_data.append(gen(str(v2), style2))
+
+            diff_table.add_row(*row_data)
+            self.console.print(diff_table)
 
     def analyze_row_differences(
         self,
@@ -1223,7 +1333,7 @@ def main():
         root.withdraw()  # Hide the main window
         root.attributes("-topmost", True)  # Bring dialogs to front
 
-        console.print("[cyan]Please select Database 1 file...[/cyan]")
+        console.print(gen("Please select Database 1 file...", "cyan"))
         db1_path = filedialog.askopenfilename(
             title="Select Database 1 (.db file)",
             filetypes=[
@@ -1237,14 +1347,14 @@ def main():
 
         if not db1_path:
             console.print(
-                "[bold red]No file selected for Database 1. Exiting...[/bold red]"
+                gen("No file selected for Database 1. Exiting...", "bold red")
             )
             root.destroy()
             sys.exit(0)
 
-        console.print(f"[green]✓ Selected DB1: {db1_path}[/green]")
+        console.print(gen(f"✓ Selected DB1: {db1_path}", "green"))
 
-        console.print("[cyan]Please select Database 2 file...[/cyan]")
+        console.print(gen("Please select Database 2 file...", "cyan"))
         db2_path = filedialog.askopenfilename(
             title="Select Database 2 (.db file)",
             filetypes=[
@@ -1258,12 +1368,12 @@ def main():
 
         if not db2_path:
             console.print(
-                "[bold red]No file selected for Database 2. Exiting...[/bold red]"
+                gen("No file selected for Database 2. Exiting...", "bold red")
             )
             root.destroy()
             sys.exit(0)
 
-        console.print(f"[green]✓ Selected DB2: {db2_path}[/green]")
+        console.print(gen(f"✓ Selected DB2: {db2_path}", "green"))
 
         # Destroy the tkinter root window
         root.destroy()
@@ -1272,17 +1382,87 @@ def main():
         # Create comparator and run comparison
         comparator = SQLiteComparator(db1_path, db2_path)
 
-        with console.status("[bold green]Comparing databases...", spinner="dots"):
+        with console.status(gen("Comparing databases...", "bold green"), spinner="dots"):
             comparison_result = comparator.compare_databases()
 
         # Display results
         comparator.display_results(comparison_result)
 
+        # Check if schemas and table names are identical
+        if (
+            not comparison_result.tables_only_in_db1
+            and not comparison_result.tables_only_in_db2
+            and all(comp.schema_match for comp in comparison_result.table_comparisons.values())
+        ):
+            if Confirm.ask(gen("Do you want to specifically compare one of the tables?", "bold cyan")):
+                tables = sorted(comparison_result.common_tables)
+                console.print(gen("\nAvailable tables:", "bold white"))
+                for i, table in enumerate(tables, 1):
+                    comp = comparison_result.table_comparisons[table]
+                    style = "bold green" if comp.is_identical else "bold red"
+                    console.print(f"{i}. {gen(table, style)}")
+
+                table_num_str = Prompt.ask(
+                    "Select table number",
+                    choices=[str(i) for i in range(1, len(tables) + 1)]
+                )
+                table_num = int(table_num_str)
+                table_name = tables[table_num - 1]
+
+                # Get schema and columns
+                with comparator.get_connection(comparator.db1_path) as conn:
+                    schema = comparator.get_table_schema(conn, table_name)
+
+                columns = [col[1] for col in schema]
+
+                # Compute mismatched columns using PK as reference
+                pk_cols = [col[1] for col in schema if col[5] != 0]  # PK flag
+                if not pk_cols:
+                    pk_cols = [columns[0]] if columns else []
+
+                data1 = comparator.get_table_data(comparator.get_connection(comparator.db1_path), table_name)
+                data2 = comparator.get_table_data(comparator.get_connection(comparator.db2_path), table_name)
+
+                def make_key(row):
+                    return tuple(row.get(col) for col in pk_cols)
+
+                data1_map = {make_key(row): row for row in data1}
+                data2_map = {make_key(row): row for row in data2}
+
+                common_keys = set(data1_map) & set(data2_map)
+                mismatched_cols = set()
+                for key in common_keys:
+                    row1 = data1_map[key]
+                    row2 = data2_map[key]
+                    for col in columns:
+                        if row1.get(col) != row2.get(col):
+                            mismatched_cols.add(col)
+
+                # List columns with color
+                console.print(gen("\nAvailable columns:", "bold white"))
+                for i, col in enumerate(columns, 1):
+                    style = "bold red" if col in mismatched_cols else "bold green"
+                    console.print(f"{i}. {gen(col, style)}")
+
+                # Prompt for columns to compare
+                column_nums_str = Prompt.ask(
+                    gen("Enter column numbers to check (comma-separated, e.g., 1,2,3)", "bold cyan"),
+                    default="all"
+                )
+
+                if column_nums_str.lower() == "all":
+                    selected_compare_columns = columns
+                else:
+                    column_nums = [int(x.strip()) for x in column_nums_str.split(",") if x.strip()]
+                    selected_compare_columns = [columns[n - 1] for n in column_nums if 1 <= n <= len(columns)]
+
+                comparator.detailed_table_comparison(table_name, selected_compare_columns)
+
     except FileNotFoundError as e:
-        console.print(f"[bold red]Error: {e}[/bold red]")
+        console.print(gen(f"Error: {e}", "bold red"))
         sys.exit(1)
     except Exception as e:
-        console.print(f"[bold red]An error occurred: {e}[/bold red]")
+        console.print(gen(f"An error occurred: {e}", "bold red"))
         import traceback
 
         traceback.print_exc()
